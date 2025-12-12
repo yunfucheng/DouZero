@@ -84,7 +84,7 @@ class LLMAgent:
         return position_names.get(position, position)
     
     def create_json_prompt_with_history(self, infoset) -> str:
-        """创建包含历史对话的JSON格式提示词"""
+        """创建包含历史对话的JSON格式提示词（优化版，减少token消耗）"""
         
         # 当前手牌
         hand_cards = infoset.player_hand_cards.copy()
@@ -94,148 +94,111 @@ class LLMAgent:
         last_move = infoset.last_move
         last_move_str = self.format_cards(last_move) if last_move else "无"
         
-        # 可选动作
+        # 可选动作（简化格式）
         legal_actions = infoset.legal_actions
         action_choices = []
         for i, action in enumerate(legal_actions):
             action_str = self.format_cards(action)
-            action_choices.append({"index": i, "cards": action_str})
+            action_choices.append(f"{i}: {action_str}")
         
         # 游戏状态信息
         position_name = self.get_position_name(self.position)
         
-        # 分析当前局势
-        has_bomb = any(len(action) == 4 and len(set(action)) == 1 for action in legal_actions)
-        has_rocket = any(action == [20, 30] for action in legal_actions)
-        
-        strategy_tips = []
-        if not last_move:
-            strategy_tips.append("你是第一个出牌，应该主动出牌控制局面")
-        elif len(legal_actions) > 1:
-            # 有过牌选项和其他出牌选项
-            non_pass_actions = [i for i, action in enumerate(legal_actions) if action]
-            if non_pass_actions:
-                strategy_tips.append("你有可以压制的牌，考虑是否值得出牌")
-                strategy_tips.append("如果手牌优势不大，可以过牌保存实力")
-        
-        if has_bomb:
-            strategy_tips.append("你有炸弹，可以在关键时刻使用")
-        if has_rocket:
-            strategy_tips.append("你有王炸，是最大的牌，谨慎使用")
-            
-        strategy_text = " ".join(strategy_tips) if strategy_tips else "根据牌局情况做出最优选择"
-        
-        # 构建包含历史对话的提示词
+        # 简化历史记录 - 只保留最近5轮的关键决策
         history_summary = ""
         if self.conversation_history:
-            recent_history = self.conversation_history[-10:]  # 只显示最近10轮
-            history_summary = "**历史出牌记录**:\n"
-            for i, msg in enumerate(recent_history):
-                if msg["role"] == "assistant":
-                    history_summary += f"你的决策: {msg['content'][:50]}...\n"
-                elif msg["role"] == "user":
-                    # 提取关键信息
-                    if "你的手牌" in msg["content"]:
-                        history_summary += f"第{len(recent_history)-i}轮出牌\n"
-            history_summary += "\n"
+            recent_decisions = []
+            for msg in reversed(self.conversation_history[-10:]):  # 最近10条消息
+                if msg["role"] == "assistant" and "action_index" in msg.get("content", ""):
+                    try:
+                        decision = json.loads(msg["content"])
+                        if "reason" in decision:
+                            recent_decisions.append(decision["reason"][:30] + "...")
+                    except:
+                        continue
+                
+                if len(recent_decisions) >= 5:  # 只保留最近5个决策
+                    break
+            
+            if recent_decisions:
+                history_summary = "最近决策: " + " | ".join(reversed(recent_decisions)) + "\n"
         
-        prompt = f"""你是一位经验丰富的斗地主玩家。现在是你的回合，请根据当前牌局情况和历史出牌记录做出最优决策。
+        # 简化提示词，去除重复的规则说明
+        prompt = f"""斗地主决策。位置: {position_name}。手牌: {hand_cards_str}。上家: {last_move_str}。
 
-请严格按照以下JSON格式输出你的决策结果：
-```json
-{{
-    "action_index": 0,
-    "reason": "你的决策理由",
-    "confidence": 0.8
-}}
-```
+{history_summary}可选动作:
+{"; ".join(action_choices)}
 
-**你的位置**: {position_name}
-**你的手牌**: {hand_cards_str}
-**上家出牌**: {last_move_str}
+输出JSON格式: {{"action_index": 0, "reason": "简要理由", "confidence": 0.8}}
 
-{history_summary}**可选动作**:
-{json.dumps(action_choices, ensure_ascii=False, indent=2)}
+策略要点:
+{"- 先手出小牌试探" if not last_move else "- 压制用最小牌"}
+{"- 有炸弹可留后手" if any(len(action) == 4 and len(set(action)) == 1 for action in legal_actions) else ""}
+{"- 王炸谨慎使用" if any(action == [20, 30] for action in legal_actions) else ""}
 
-**斗地主规则**:
-1. 如果有上家出牌，你可以选择出相同类型且更大的牌，或者过牌
-2. 炸弹可以压制任何非炸弹牌型
-3. 王炸是最大的牌型
-4. 作为{position_name}，要考虑团队配合和出牌策略
-
-**策略建议**: {strategy_text}
-
-**当前分析**:
-- 手牌数量: {len(hand_cards)} 张
-{("- 有炸弹牌型" if has_bomb else "") + ("\n- 有王炸" if has_rocket else "")}
-
-请仔细分析当前局势和历史出牌情况，选择最优的出牌策略。记住：
-- 观察对手的出牌模式，判断其手牌情况
-- 根据历史出牌调整自己的策略
-- 考虑团队配合和后续出牌
-
-重要：只返回JSON格式的决策，不要输出其他内容。"""
+选择最优动作:"""
         
         return prompt.strip()
     
     def call_llm_api_json(self, prompt: str) -> Dict[str, Any]:
-        """调用大模型API，使用JSON格式输出"""
-        try:
-            # 构建包含历史对话的消息列表
-            messages = [
-                {
-                    "role": "system", 
-                    "content": "你是一位专业的斗地主玩家，只返回JSON格式的决策结果。保持理由简洁明了。"
-                }
-            ]
-            
-            # 添加历史对话
-            messages.extend(self.conversation_history)
-            
-            # 添加当前提示词
-            messages.append({
-                "role": "user",
-                "content": prompt
-            })
-            
-            payload = {
-                "model": self.model,
-                "messages": messages,
-                "response_format": {"type": "json_object"},
-                "temperature": 0.4,
-                "max_tokens": 300
-            }
-            
-            response = requests.post(
-                f"{self.api_url}/chat/completions",
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content'].strip()
-                
-                # 添加到历史记录
-                self.add_to_history("user", prompt)
-                self.add_to_history("assistant", content)
-                
-                # 解析JSON响应
-                try:
-                    decision = json.loads(content)
-                    return decision
-                except json.JSONDecodeError as e:
-                    print(f"JSON解析失败: {e}")
-                    print(f"响应内容: {content}")
-                    return None
-            else:
-                print(f"API调用失败: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            print(f"调用大模型API时发生错误: {e}")
-            return None
+         """调用大模型API，使用JSON格式输出"""
+         try:
+             # 构建包含历史对话的消息列表
+             messages = [
+                 {
+                     "role": "system", 
+                     "content": "你是一位专业的斗地主玩家，只返回JSON格式的决策结果。保持理由简洁明了。"
+                 }
+             ]
+             
+             # 添加历史对话 - 限制历史记录长度
+             recent_history = self.conversation_history[-6:] if len(self.conversation_history) > 6 else self.conversation_history
+             messages.extend(recent_history)
+             
+             # 添加当前提示词
+             messages.append({
+                 "role": "user",
+                 "content": prompt
+             })
+             
+             payload = {
+                 "model": self.model,
+                 "messages": messages,
+                 "response_format": {"type": "json_object"},
+                 "temperature": 0.4,
+                 "max_tokens": 150  # 减少max_tokens限制
+             }
+             
+             response = requests.post(
+                 f"{self.api_url}/chat/completions",
+                 headers=self.headers,
+                 json=payload,
+                 timeout=30
+             )
+             
+             if response.status_code == 200:
+                 result = response.json()
+                 content = result['choices'][0]['message']['content'].strip()
+                 
+                 # 添加到历史记录 - 保持精简
+                 self.add_to_history("user", prompt)
+                 self.add_to_history("assistant", content)
+                 
+                 # 解析JSON响应
+                 try:
+                     decision = json.loads(content)
+                     return decision
+                 except json.JSONDecodeError as e:
+                     print(f"JSON解析失败: {e}")
+                     print(f"响应内容: {content}")
+                     return None
+             else:
+                 print(f"API调用失败: {response.status_code} - {response.text}")
+                 return None
+                 
+         except Exception as e:
+             print(f"调用大模型API时发生错误: {e}")
+             return None
     
     def parse_json_response(self, decision: Dict[str, Any], legal_actions: List[List[int]]) -> int:
         """解析JSON格式的大模型响应"""

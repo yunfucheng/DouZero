@@ -76,22 +76,21 @@ class HumanAgent:
                 print("请输入有效的数字")
 
 def play_single_game(card_play_data, players, verbose=True):
-    """进行一局游戏"""
+    """玩一局游戏"""
     
-    # 创建游戏环境
     env = Env('wp')  # 使用wp目标
-    
-    # 初始化游戏
     env.reset()
     env._env.card_play_init(card_play_data)
     
     if verbose:
         print("=" * 60)
-        print("新游戏开始！")
-        print("=" * 60)
-        print(f"地主手牌: {format_hand_cards(env._env.info_sets['landlord'].player_hand_cards)}")
-        print(f"地主上家手牌: {format_hand_cards(env._env.info_sets['landlord_up'].player_hand_cards)}")
-        print(f"地主下家手牌: {format_hand_cards(env._env.info_sets['landlord_down'].player_hand_cards)}")
+        print("新局开始！")
+        
+        # 显示手牌
+        format_cards = lambda cards: " ".join([str(card) for card in cards])
+        print(f"地主手牌: {format_cards(card_play_data['landlord'])}")
+        print(f"地主上家手牌: {format_cards(card_play_data['landlord_up'])}")
+        print(f"地主下家手牌: {format_cards(card_play_data['landlord_down'])}")
         print(f"地主底牌: {format_cards(env._env.three_landlord_cards)}")
         print("-" * 60)
     
@@ -177,13 +176,13 @@ def main():
     # 与evaluate.py保持一致的参数格式
     parser.add_argument('--landlord', type=str,
                        default='random',
-                       help='地主智能体 (random, rlcard, human, 或模型路径如baselines/douzero_ADP/landlord.ckpt)')
+                       help='地主智能体 (random, rlcard, human, llm, 或模型路径如baselines/douzero_ADP/landlord.ckpt)')
     parser.add_argument('--landlord_up', type=str,
                        default='random',
-                       help='地主上家智能体 (random, rlcard, human, 或模型路径)')
+                       help='地主上家智能体 (random, rlcard, human, llm, 或模型路径)')
     parser.add_argument('--landlord_down', type=str,
                        default='random',
-                       help='地主下家智能体 (random, rlcard, human, 或模型路径)')
+                       help='地主下家智能体 (random, rlcard, human, llm, 或模型路径)')
     parser.add_argument('--num_games', type=int, default=1,
                        help='游戏局数')
     parser.add_argument('--verbose', action='store_true', default=True,
@@ -192,6 +191,12 @@ def main():
                        help='只显示统计信息，不显示每局详情')
     parser.add_argument('--eval_data', type=str, default=None,
                        help='使用预设的评估数据文件，如果不指定则随机生成')
+    parser.add_argument('--llm_api_key', type=str, default=None,
+                       help='大模型API密钥（使用llm agent时必需）')
+    parser.add_argument('--llm_api_url', type=str, default="https://api.deepseek.com/",
+                       help='大模型API接口地址')
+    parser.add_argument('--llm_model', type=str, default="deepseek-chat",
+                       help='大模型名称')
     
     args = parser.parse_args()
     
@@ -235,13 +240,16 @@ def main():
         card_play_data_list = [generate_card_play_data() for _ in range(args.num_games)]
         print(f"随机生成{args.num_games}局游戏数据")
     
+    # 创建LLM Agent实例池，实现实例复用
+    llm_agents_pool = {}
+    
     # 运行游戏
     results = []
     for game_id in range(args.num_games):
         if args.num_games > 1 and not args.stats_only:
             print(f"\n第 {game_id + 1} 局游戏:")
         
-        # 为每局游戏创建新的玩家实例（避免状态污染）
+        # 为每局游戏创建新的玩家实例（避免状态污染），但LLM Agent复用实例
         players = {}
         
         # 分别加载每个位置的agent
@@ -255,6 +263,23 @@ def main():
             elif agent_type == 'rlcard':
                 from douzero.evaluation.rlcard_agent import RLCardAgent
                 players[pos] = RLCardAgent(pos)
+            elif agent_type == 'llm':
+                from douzero.evaluation.llm_agent import LLMAgent
+                if not args.llm_api_key:
+                    print(f"错误：使用llm agent时必须提供--llm_api_key参数")
+                    return
+                
+                # 复用LLM Agent实例，避免重复创建
+                if pos not in llm_agents_pool:
+                    llm_agents_pool[pos] = LLMAgent(pos, api_url=args.llm_api_url, 
+                                                      model=args.llm_model, api_key=args.llm_api_key)
+                
+                players[pos] = llm_agents_pool[pos]
+                
+                # 新局开始时重置历史对话
+                if game_id == 0:  # 第一局游戏
+                    players[pos].reset_conversation_history()
+                
             else:
                 # 模型路径
                 from douzero.evaluation.deep_agent import DeepAgent
@@ -279,8 +304,6 @@ def main():
         print(f"地主胜率: {landlord_wins}/{args.num_games} ({landlord_wins/args.num_games*100:.1f}%)")
         print(f"农民胜率: {farmer_wins}/{args.num_games} ({farmer_wins/args.num_games*100:.1f}%)")
         print(f"平均每局回合数: {avg_moves:.1f}")
-        print(f"平均每局炸弹数: {avg_bombs:.1f}")
-        print(f"{'='*60}")
 
 if __name__ == '__main__':
     main()

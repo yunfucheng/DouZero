@@ -154,17 +154,18 @@ class GameEnv(object):
     def get_acting_player_position(self):
         if self.acting_player_position is None:
             self.acting_player_position = 'landlord'
-
-        else:
+            # 第一次初始化，不轮换，直接返回地主
+            return self.acting_player_position
+        
+        # 只有在有出牌动作后才轮换玩家
+        if len(self.card_play_action_seq) > 0:
             if self.acting_player_position == 'landlord':
                 self.acting_player_position = 'landlord_down'
-
             elif self.acting_player_position == 'landlord_down':
                 self.acting_player_position = 'landlord_up'
-
             else:
                 self.acting_player_position = 'landlord'
-
+        
         return self.acting_player_position
 
     def update_acting_player_hand_cards(self, action):
@@ -370,3 +371,4 @@ class InfoSet(object):
         self.last_pid = None
         # The number of bombs played so far
         self.bomb_num = None
+

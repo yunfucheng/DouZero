@@ -83,8 +83,32 @@ class LLMAgent:
         }
         return position_names.get(position, position)
     
-    def create_json_prompt_with_history(self, infoset) -> str:
-        """创建包含历史对话的JSON格式提示词（优化版，减少token消耗）"""
+    def _debug_messages_to_file(self, messages: List[Dict[str, Any]]):
+        """将messages输出到文本文件，方便调试"""
+        try:
+            import os
+            from datetime import datetime
+            
+            # 创建debug目录（如果不存在）
+            debug_dir = "debug_logs"
+            if not os.path.exists(debug_dir):
+                os.makedirs(debug_dir)
+            
+            # 生成文件名（包含时间戳和位置）
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            position_name = self.get_position_name(self.position)
+            filename = f"{debug_dir}/llm_messages_{position_name}_{timestamp}.json"
+            
+            # 将messages写入文件
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(messages, f, ensure_ascii=False, indent=2)
+            
+            print(f"调试信息已保存到: {filename}")
+        except Exception as e:
+            print(f"保存调试信息时出错: {e}")
+    
+    def create_card_prompt_with_history(self, infoset) -> str:
+        """创建包含历史对话的提示词，让LLM直接输出要出的牌"""
         
         # 当前手牌
         hand_cards = infoset.player_hand_cards.copy()
@@ -94,13 +118,6 @@ class LLMAgent:
         last_move = infoset.last_move
         last_move_str = self.format_cards(last_move) if last_move else "无"
         
-        # 可选动作（简化格式）
-        legal_actions = infoset.legal_actions
-        action_choices = []
-        for i, action in enumerate(legal_actions):
-            action_str = self.format_cards(action)
-            action_choices.append(f"{i}: {action_str}")
-        
         # 游戏状态信息
         position_name = self.get_position_name(self.position)
         
@@ -109,7 +126,7 @@ class LLMAgent:
         if self.conversation_history:
             recent_decisions = []
             for msg in reversed(self.conversation_history[-10:]):  # 最近10条消息
-                if msg["role"] == "assistant" and "action_index" in msg.get("content", ""):
+                if msg["role"] == "assistant" and "cards" in msg.get("content", ""):
                     try:
                         decision = json.loads(msg["content"])
                         if "reason" in decision:
@@ -123,18 +140,17 @@ class LLMAgent:
             if recent_decisions:
                 history_summary = "最近决策: " + " | ".join(reversed(recent_decisions)) + "\n"
         
-        # 简化提示词，去除重复的规则说明
+        # 简化提示词，让LLM直接输出要出的牌
         prompt = f"""斗地主决策。位置: {position_name}。手牌: {hand_cards_str}。上家: {last_move_str}。
 
-{history_summary}可选动作:
-{"; ".join(action_choices)}
+{history_summary}输出你要出的牌，使用空格分隔，例如"3 3 3"或"过牌"。
 
-输出JSON格式: {{"action_index": 0, "reason": "简要理由", "confidence": 0.8}}
+输出JSON格式: {{"cards": "3 3 3", "reason": "简要理由", "confidence": 0.8}}
 
 策略要点:
 {"- 先手出小牌试探" if not last_move else "- 压制用最小牌"}
-{"- 有炸弹可留后手" if any(len(action) == 4 and len(set(action)) == 1 for action in legal_actions) else ""}
-{"- 王炸谨慎使用" if any(action == [20, 30] for action in legal_actions) else ""}
+{"- 有炸弹可留后手" if any(len(action) == 4 and len(set(action)) == 1 for action in infoset.legal_actions) else ""}
+{"- 王炸谨慎使用" if any(action == [20, 30] for action in infoset.legal_actions) else ""}
 
 选择最优动作:"""
         
@@ -160,6 +176,9 @@ class LLMAgent:
                  "role": "user",
                  "content": prompt
              })
+             
+             # 将messages输出到文本文件，方便调试
+             self._debug_messages_to_file(messages)
              
              payload = {
                  "model": self.model,
@@ -200,37 +219,70 @@ class LLMAgent:
              print(f"调用大模型API时发生错误: {e}")
              return None
     
-    def parse_json_response(self, decision: Dict[str, Any], legal_actions: List[List[int]]) -> int:
-        """解析JSON格式的大模型响应"""
-        if not decision or 'action_index' not in decision:
+    def parse_card_response(self, decision: Dict[str, Any], legal_actions: List[List[int]]) -> int:
+        """解析LLM输出的牌，匹配到对应的可选动作索引"""
+        if not decision or 'cards' not in decision:
             return 0  # 默认选择第一个动作（通常是过牌）
         
         try:
-            action_idx = int(decision['action_index'])
-            if 0 <= action_idx < len(legal_actions):
-                # 如果有reason字段，打印决策理由
-                if 'reason' in decision:
-                    reason = decision['reason']
-                    # 截断过长的理由，避免输出混乱
-                    if len(reason) > 100:
-                        reason = reason[:100] + "..."
-                    print(f"LLM决策理由: {reason}")
-                return action_idx
-            else:
-                print(f"动作索引{action_idx}超出范围，使用默认值0")
+            cards_str = decision['cards'].strip()
+            
+            # 如果是过牌，返回过牌动作的索引
+            if cards_str == "过牌" or cards_str.lower() == "pass":
+                for i, action in enumerate(legal_actions):
+                    if not action:  # 空列表表示过牌
+                        return i
+                return 0  # 如果没找到过牌动作，返回第一个
+            
+            # 将牌字符串转换为环境卡牌列表
+            cards_list = []
+            for card_name in cards_str.split():
+                if card_name in self.RealCard2EnvCard:
+                    cards_list.append(self.RealCard2EnvCard[card_name])
+            
+            # 如果没有有效的牌，返回默认值
+            if not cards_list:
                 return 0
+            
+            # 在合法动作中查找匹配的动作
+            for i, action in enumerate(legal_actions):
+                if sorted(action) == sorted(cards_list):
+                    # 如果有reason字段，打印决策理由
+                    if 'reason' in decision:
+                        reason = decision['reason']
+                        # 截断过长的理由，避免输出混乱
+                        if len(reason) > 100:
+                            reason = reason[:100] + "..."
+                        print(f"LLM决策理由: {reason}")
+                    return i
+            
+            # 如果没找到完全匹配的动作，尝试部分匹配
+            for i, action in enumerate(legal_actions):
+                if len(action) == len(cards_list):
+                    # 如果长度相同，可能是顺序问题，尝试匹配
+                    if set(action) == set(cards_list):
+                        if 'reason' in decision:
+                            reason = decision['reason']
+                            if len(reason) > 100:
+                                reason = reason[:100] + "..."
+                            print(f"LLM决策理由: {reason} (部分匹配)")
+                        return i
+            
+            # 如果还是没找到，返回默认值
+            print(f"无法匹配动作 {cards_str}，使用默认值0")
+            return 0
                 
         except (ValueError, TypeError) as e:
-            print(f"解析JSON决策时发生错误: {e}")
+            print(f"解析牌决策时发生错误: {e}")
             return 0
     
     def act(self, infoset) -> List[int]:
-        """大模型决策动作，使用JSON格式和历史对话"""
+        """大模型决策动作，使用牌输出和历史对话"""
         if len(infoset.legal_actions) == 1:
             return infoset.legal_actions[0]
         
-        # 创建包含历史对话的JSON格式提示词
-        prompt = self.create_json_prompt_with_history(infoset)
+        # 创建包含历史对话的提示词，让LLM直接输出要出的牌
+        prompt = self.create_card_prompt_with_history(infoset)
         
         # 调用大模型API获取JSON格式决策
         decision = self.call_llm_api_json(prompt)
@@ -239,7 +291,7 @@ class LLMAgent:
             # API调用失败，使用备用策略（选择第一个合法动作）
             return infoset.legal_actions[0]
         
-        # 解析JSON格式的决策
-        action_idx = self.parse_json_response(decision, infoset.legal_actions)
+        # 解析LLM输出的牌，匹配到对应的可选动作索引
+        action_idx = self.parse_card_response(decision, infoset.legal_actions)
         
         return infoset.legal_actions[action_idx]

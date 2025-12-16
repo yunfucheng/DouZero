@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 斗地主游戏可视化入口
 集成现有的AI agent、规则agent，并添加human agent支持
@@ -75,12 +74,17 @@ class HumanAgent:
             except ValueError:
                 print("请输入有效的数字")
 
-def play_single_game(card_play_data, players, verbose=True):
+def play_single_game(card_play_data, players, verbose=True, game_id=0):
     """玩一局游戏"""
     
     env = Env('wp')  # 使用wp目标
     env.reset()
     env._env.card_play_init(card_play_data)
+    
+    # 为LLM Agent初始化游戏日志
+    for pos, player in players.items():
+        if player.name == 'LLM':
+            player.start_new_game(f"game_{game_id+1}_{pos}")
     
     if verbose:
         print("=" * 60)
@@ -276,9 +280,19 @@ def main():
                 
                 players[pos] = llm_agents_pool[pos]
                 
-                # 新局开始时重置历史对话
+                # 新局开始时重置游戏状态
                 if game_id == 0:  # 第一局游戏
-                    players[pos].reset_conversation_history()
+                    players[pos].game_state = {
+                        'position': pos,
+                        'position_name': players[pos].get_position_name(pos),
+                        'hand_cards': [],  # 当前手牌
+                        'last_move': None,  # 上家出牌
+                        'last_player': None,  # 上一个出牌的玩家
+                        'played_cards': [],  # 已出牌记录
+                        'player_card_counts': {},  # 各玩家剩余牌数
+                        'recent_decisions': [],  # 最近决策记录
+                        'game_history': []  # 游戏历史记录
+                    }
                 
             else:
                 # 模型路径
@@ -288,12 +302,13 @@ def main():
         result = play_single_game(
             card_play_data_list[game_id],
             players,
-            verbose=not args.stats_only and (args.num_games == 1 or not args.stats_only)
+            verbose=not args.stats_only and (args.num_games == 1 or not args.stats_only),
+            game_id=game_id
         )
         results.append(result)
     
     # 显示统计信息
-    if args.num_games > 1:
+    if args.num_games > 0:
         landlord_wins = sum(1 for r in results if r['winner'] == 'landlord')
         farmer_wins = sum(1 for r in results if r['winner'] == 'farmer')
         avg_moves = sum(r['move_count'] for r in results) / len(results)

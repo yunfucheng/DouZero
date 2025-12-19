@@ -13,9 +13,9 @@ from typing import List, Dict, Any
 class LLMAgent:
     """基于大模型的智能体"""
     
-    def __init__(self, position: str, api_url: str = "https://api.deepseek.com/v3.2_speciale_expires_on_20251215",  # https://api.deepseek.com/
-                 # model: str = "deepseek-chat", api_key: str = None):
-                 model: str = "deepseek-reasoner", api_key: str = None):
+    def __init__(self, position: str, api_url: str = "https://api.deepseek.com",  # https://api.deepseek.com/
+                 model: str = "deepseek-chat", api_key: str = None):
+                 # model: str = "deepseek-reasoner", api_key: str = None):
         """
         初始化大模型智能体
         
@@ -265,12 +265,10 @@ class LLMAgent:
         # 上家出牌
         last_move_str = self.format_cards(self.game_state['last_move']) if self.game_state['last_move'] else "无"
         
-        # 构建历史对局记录（全量历史，使用缩写）
+        # 构建历史对局记录（优化格式，添加统计信息）
         history = ""
         if self.game_state.get('played_cards_with_player'):
-            # 完整历史记录
             all_plays = self.game_state['played_cards_with_player']
-            history_parts = []
             
             # 角色缩写映射
             role_abbr = {
@@ -279,15 +277,83 @@ class LLMAgent:
                 'landlord_down': 'D'  # Down
             }
             
-            for i, (player, play) in enumerate(all_plays):
-                # 获取角色缩写，如果未知则标记为?
-                abbr = role_abbr.get(player, '?')
-                play_str = self.format_cards(play) if play else "过"
-                round_num = i + 1
-                history_parts.append(f"{round_num:02d}{abbr}: {play_str}")
+            # 统计信息
+            stats = {
+                'landlord': {'count': 0, 'bombs': 0, 'types': []},
+                'landlord_up': {'count': 0, 'bombs': 0, 'types': []},
+                'landlord_down': {'count': 0, 'bombs': 0, 'types': []}
+            }
             
-            # 格式化历史记录，使其更紧凑但易读
-            history = "\n历史对局([序号][地主L|上家U|下家D]): " + ", ".join(history_parts)
+            # 计算统计信息
+            for player, play in all_plays:
+                stats[player]['count'] += 1
+                if play:
+                    # 判断牌型
+                    play_len = len(play)
+                    if play_len == 1:
+                        stats[player]['types'].append('单牌')
+                    elif play_len == 2:
+                        stats[player]['types'].append('对子')
+                    elif play_len == 3:
+                        stats[player]['types'].append('三不带')
+                    elif play_len == 4:
+                        stats[player]['types'].append('炸弹')
+                        stats[player]['bombs'] += 1
+                    elif play_len > 4:
+                        if all(card == play[0] for card in play):
+                            stats[player]['types'].append('炸弹')
+                            stats[player]['bombs'] += 1
+                        else:
+                            stats[player]['types'].append('顺子')
+                else:
+                    stats[player]['types'].append('过牌')
+            
+            # 格式化统计信息
+            stats_str = "\n【出牌统计】"
+            for player, data in stats.items():
+                abbr = role_abbr[player]
+                bomb_count = data['bombs']
+                play_count = data['count']
+                # 获取主要牌型（出现次数最多的）
+                from collections import Counter
+                type_counts = Counter(data['types'])
+                main_types = type_counts.most_common(2)
+                main_types_str = ", ".join([f"{t}:{c}次" for t, c in main_types])
+                stats_str += f" {abbr}:{play_count}次(炸{bomb_count})[{main_types_str}]" 
+            
+            # 按轮次分组展示历史
+            history_str = "\n【详细对局】"
+            rounds = []
+            current_round = []
+            
+            for i, (player, play) in enumerate(all_plays):
+                abbr = role_abbr[player]
+                play_str = self.format_cards(play) if play else "过"
+                current_round.append(f"{abbr}:{play_str}")
+                
+                # 每3个动作（地主、下家、上家）为一轮
+                if (i + 1) % 3 == 0:
+                    round_num = (i + 1) // 3
+                    rounds.append(f"{round_num:02d}: {', '.join(current_round)}")
+                    current_round = []
+            
+            # 添加最后一轮（如果不完整）
+            if current_round:
+                round_num = len(rounds) + 1
+                rounds.append(f"{round_num:02d}: {', '.join(current_round)}")
+            
+            # 只显示最近10轮（如果超过10轮）
+            if len(rounds) > 10:
+                history_str += "\n最近10轮（完整记录请查看日志）:"
+                rounds = rounds[-10:]
+            else:
+                history_str += "\n全部轮次:"
+            
+            for round in rounds:
+                history_str += f"\n  {round}"
+            
+            # 组合完整历史信息
+            history = stats_str + history_str
         
         # 构建合法动作列表
         legal_actions = []
@@ -302,38 +368,137 @@ class LLMAgent:
         # 未知牌字段 - 显示剩余未知的牌（其他两家的手牌集合）
         unknown_cards_str = self._calculate_unknown_cards_str()
         
+        # 关键牌分析
+        remaining_cards = self._calculate_unknown_cards_str()
+        key_cards = {}
+        for card in [30, 20, 17, 14]:  # 大王、小王、2、A
+            card_name = self.EnvCard2RealCard[card]
+            count = remaining_cards.count(card_name) + self.game_state['hand_cards'].count(card)
+            key_cards[card_name] = count
+        
+        key_cards_str = " | ".join([f"{name}: {count}张" for name, count in key_cards.items()])
+        
         # 构建完整提示词
         
-        # 1. 角色与目标
+        # 1. 角色与目标 - 更详细的多角色策略
         role_desc = ""
+        role_strategy = ""
+        
         if self.position == 'landlord':
-            role_desc = "你是【地主】。目标：打完手中所有牌。你需要独自对抗两家农民。"
+            role_desc = "你是【地主】。"
+            role_strategy = """目标：打完手中所有牌，独自对抗两家农民。
+核心策略：
+- 优先拆牌保持牌型多样性，灵活应对农民的防守
+- 合理使用大牌控制牌局节奏
+- 注意观察农民的牌型，寻找突破口
+- 当有一家农民只剩少量牌时，全力阻止其跑牌
+- 利用农民之间的配合漏洞，各个击破"""
         elif self.position == 'landlord_up':
-            role_desc = "你是【地主上家】（农民）。目标：你或你的队友（地主下家）先打完牌。策略：主要任务是顶住地主的牌，不让地主过小牌，必要时牺牲自己保队友。"
+            role_desc = "你是【地主上家】（农民）。"
+            role_strategy = """目标：与队友（地主下家）配合，先于地主打完手牌。
+核心策略：
+- 首要任务是"顶牌"：用最大的牌顶住地主，不让地主过小牌
+- 优先消耗地主的大牌，尤其是王和2
+- 避免让地主获得自由出牌权
+- 注意观察队友的牌型，为队友创造跑牌机会
+- 必要时牺牲自己，保存队友的实力
+- 当队友只剩少量牌时，全力支持队友跑牌"""
         elif self.position == 'landlord_down':
-            role_desc = "你是【地主下家】（农民）。目标：你或你的队友（地主上家）先打完牌。策略：地主上家会限制地主，你需要伺机跑牌，或者在地主上家顶不住时接力。"
+            role_desc = "你是【地主下家】（农民）。"
+            role_strategy = """目标：与队友（地主上家）配合，先于地主打完手牌。
+核心策略：
+- 首要任务是"跑牌"：利用队友顶牌的机会，尽快打出手中的牌
+- 当地主过牌时，抓住机会发动进攻
+- 观察队友的出牌意图，配合队友的策略
+- 保存一定的大牌用于关键时刻
+- 当队友只剩少量牌时，积极配合队友跑牌"""
             
-        # 2. 剩余牌数分析
+        # 2. 剩余牌数分析 - 手动计算（确保准确性）
         card_counts_info = ""
+        
+        # 如果infoset有player_card_counts属性，优先使用
         if self.game_state.get('player_card_counts'):
             counts = []
             for pos, count in self.game_state['player_card_counts'].items():
                 name = self.get_position_name(pos)
                 counts.append(f"{name}: {count}张")
             card_counts_info = " | ".join(counts)
+        else:
+            # 手动计算各家剩余手牌数
+            total_cards = 54  # 一副牌总共有54张
             
-        # 3. 关键牌分析 (2, 王)
-        key_cards_analysis = ""
-        # 简单的剩余大牌分析已经在 _calculate_remaining_cards 中实现，这里可以复用或增强
-        # 这里直接使用 _calculate_unknown_cards_str 返回的结果，并在prompt中引导LLM注意
+            # 计算已出牌总数
+            played_cards_count = 0
+            for move in self.game_state['played_cards']:
+                if move:  # 非空动作
+                    played_cards_count += len(move)
+            
+            # 计算自己的手牌数
+            my_cards_count = len(self.game_state['hand_cards'])
+            
+            # 计算对手剩余牌数总和
+            opponents_total = total_cards - played_cards_count - my_cards_count
+            
+            # 合理分配给两家对手（简单均分，剩余1张随机分配）
+            opponent1_count = opponents_total // 2
+            opponent2_count = opponents_total - opponent1_count
+            
+            # 根据当前位置确定对手名称
+            if self.position == 'landlord':
+                # 地主的对手是两家农民
+                card_counts_info = f"地主: {my_cards_count}张 | 地主上家: {opponent1_count}张 | 地主下家: {opponent2_count}张"
+            else:
+                # 农民的对手是地主和另一家农民
+                if self.position == 'landlord_up':
+                    card_counts_info = f"地主: {opponent1_count}张 | 地主上家: {my_cards_count}张 | 地主下家: {opponent2_count}张"
+                else:  # landlord_down
+                    card_counts_info = f"地主: {opponent1_count}张 | 地主上家: {opponent2_count}张 | 地主下家: {my_cards_count}张"
         
-        prompt = f"""角色: {role_desc}
-当前位置: {self.game_state['position_name']}
+        # 3. 队友/对手识别
+        teammate_info = ""
+        if self.position == 'landlord_up':
+            teammate_info = "你的队友是地主下家，你们需要配合击败地主。"
+        elif self.position == 'landlord_down':
+            teammate_info = "你的队友是地主上家，你们需要配合击败地主。"
+        else:
+            teammate_info = "你没有队友，需要独自对抗两家农民。"
+        
+        # 4. 牌局阶段判断
+        total_cards = 54
+        played_cards_count = 0
+        for move in self.game_state['played_cards']:
+            if move:
+                played_cards_count += len(move)
+        
+        # 计算已出牌比例
+        played_ratio = played_cards_count / total_cards
+        
+        # 判断牌局阶段并生成策略建议
+        phase_info = ""
+        if played_ratio < 0.33:
+            phase_info = "【牌局阶段：初期】\n- 策略重点：试探牌型，建立优势\n- 优先目标：了解对手牌型，寻找己方优势牌型\n- 注意事项：不要过早暴露大牌，保持牌型灵活性"""
+        elif played_ratio < 0.66:
+            phase_info = "【牌局阶段：中期】\n- 策略重点：争夺牌权，消耗关键牌\n- 优先目标：控制牌局节奏，消耗对手关键牌\n- 注意事项：合理使用王、2等关键牌，争夺牌权"""
+        else:
+            phase_info = "【牌局阶段：后期】\n- 策略重点：全力跑牌或阻截\n- 优先目标：若手牌少则全力跑牌，若手牌多则全力阻截\n- 注意事项：精确计算剩余牌型，必要时使用关键牌"""
+        
+        prompt = f"""=== 斗地主AI决策系统 ===
+
+【角色定位】
+{role_desc}
+{role_strategy}
+{teammate_info}
+
+【当前状态】
+位置: {self.game_state['position_name']}
 各家剩余手牌数: {card_counts_info}
+关键牌剩余情况: {key_cards_str}
+{phase_info}
 
-【你的手牌】: {hand_cards_str}
+【你的手牌】
+{hand_cards_str}
 
-【当前牌局状态】
+【牌局动态】
 上家出牌: {last_move_str}
 已出牌记录: {self.format_cards(self.game_state['played_cards']) if self.game_state['played_cards'] else "无"}
 未知牌（对手/队友手中的牌）: {unknown_cards_str}
@@ -343,17 +508,44 @@ class LLMAgent:
 【合法动作选项】
 {legal_actions_str}
 
-【思考与决策】
-请分析当前局势，考虑以下因素：
-1. 你的角色职责（地主进攻/农民配合）。
-2. 对手剩余牌数（特别是如果有人只剩1-2张牌时，必须全力阻截）。
-3. 记牌：大王、小王、2、A是否已出完？
-4. 如果你是农民，你的队友是谁？不要压队友的牌，除非为了过牌权的必要转换。
+【决策指导】
+1. 角色优先: 严格按照你的角色策略出牌，地主以进攻为主，农民以上家顶牌、下家跑牌为主
+2. 历史分析: 从历史对局中分析对手出牌模式，判断其牌型结构和策略意图
+   - 分析农民配合模式（如果是地主）：观察农民是否有明显的配合策略
+   - 分析地主出牌习惯（如果是农民）：判断地主的牌型优势和弱点
+   - 统计各方出牌频率和牌型偏好
+3. 记牌推断: 从已出牌记录中精确推断
+   - 计算每种牌的剩余数量，特别是A、2、王等关键牌
+   - 推断对手可能持有的牌型组合
+   - 分析未知牌的可能分布
+4. 牌局节奏: 根据已出牌数量和剩余牌数判断牌局阶段
+   - 初期（前1/3）：试探牌型，建立优势
+   - 中期（中1/3）：争夺牌权，消耗关键牌
+   - 后期（后1/3）：全力跑牌或阻截
+5. 团队协作: 农民要互相配合，避免内战
+   - 分析队友出牌意图，给予支持
+   - 合理传递牌权，创造跑牌机会
+   - 避免压制队友的牌型
+6. 风险控制: 当有人只剩1-2张牌时，必须全力阻截
+   - 分析可能的单牌或对子组合
+   - 必要时使用关键牌阻止
+7. 关键牌控制: 合理使用王、2等关键牌
+   - 把握最佳使用时机，避免浪费
+   - 用最小的代价夺回或保持牌权
+8. 牌型多样性: 保持手牌的灵活性，适应不同情况
 
-输出JSON格式: {{"cards": "3 3 3", "reason": "你的分析与决策理由", "confidence": 0.8}}
-注意：cards字段必须完全匹配上述合法动作选项之一。如果是过牌，cards字段填"过牌"。
+【输出要求】
+请输出JSON格式的决策结果，包含：
+- cards: 要出的牌（必须完全匹配合法动作选项，过牌填"过牌"）
+- reason: 决策理由（必须包含历史分析、已出牌推断、牌局阶段判断）
+- confidence: 决策信心值（0.0-1.0）
 
-请根据以上信息，给出最佳出牌决策。"""
+示例输出:
+{{"cards": "小王 大王", "reason": "地主位置，第2轮对手出10-J-Q-K-A大顺子，必须用王炸夺回牌权，控制牌局节奏", "confidence": 0.95}}
+{{"cards": "过牌", "reason": "农民配合，队友（地主下家）正在跑对子，不占用牌权，让队友继续跑牌", "confidence": 0.9}}
+{{"cards": "2", "reason": "地主上家，第5轮地主出K，用2顶住，消耗地主大牌，符合顶牌策略", "confidence": 0.85}}
+
+请根据以上信息，结合历史对局分析和已出牌推断，给出最佳出牌决策。"""
         
         return prompt.strip()
     
